@@ -18,10 +18,10 @@ from io import BytesIO
 import gzip
 import os.path
 import json
+import subprocess
+import tempfile
 from pathlib import Path
 from typing import Dict, List
-import tempfile
-import subprocess
 
 from PIL import Image
 
@@ -34,37 +34,68 @@ from . import matrix
 
 open_utf8 = partial(open, encoding='UTF-8')
 
-def convert_video(data: bytes, max_w=256, max_h=256) -> (bytes, int, int):
+def convert_image(data: bytes, max_w=256, max_h=256) -> (bytes, int, int):
+    image: Image.Image = Image.open(BytesIO(data)).convert("RGBA")
+    new_file = BytesIO()
+    image.save(new_file, "png")
+    w, h = image.size
+    if w > max_w or h > max_h:
+        # Set the width and height to lower values so clients wouldn't show them as huge images
+        if w > h:
+            h = int(h / (w / max_w))
+            w = max_w
+        else:
+            w = int(w / (h / max_h))
+            h = max_h
+    return new_file.getvalue(), w, h
+
+
+def convert_video(data: bytes, max_w=256, max_h=256) -> (bytes, int, int, bytes):
     with tempfile.TemporaryDirectory() as tmpdir:
         input_path = os.path.join(tmpdir, "input.webm")
-        output_path = os.path.join(tmpdir, "output.apng")
+        output_path = os.path.join(tmpdir, "output.mp4")
+        thumb_path = os.path.join(tmpdir, "thumb.png")
 
         with open(input_path, "wb") as f:
             f.write(data)
 
         result = subprocess.run([
             "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-stream_loop", "-1",
             "-i", input_path,
+            "-t", "10",
             "-vf", (
                 f"scale='min({max_w},iw)':'min({max_h},ih)'"
-                f":force_original_aspect_ratio=decrease"
+                f":force_original_aspect_ratio=decrease,"
+                f"pad=ceil(iw/2)*2:ceil(ih/2)*2"
             ),
-            "-plays", "0",
-            "-f", "apng",
+            "-c:v", "libx264",
+            "-pix_fmt", "yuv420p",
+            "-an",
+            "-movflags", "+faststart",
             output_path,
         ], capture_output=True)
 
         if result.returncode != 0:
             raise RuntimeError(f"ffmpeg conversion failed: {result.stderr.decode()}")
 
-        apng_data = Path(output_path).read_bytes()
+        subprocess.run([
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-i", output_path,
+            "-vframes", "1",
+            "-f", "image2",
+            thumb_path,
+        ], capture_output=True, check=True)
 
-    image = Image.open(BytesIO(apng_data))
+        mp4_data = Path(output_path).read_bytes()
+        thumb_data = Path(thumb_path).read_bytes()
+
+    image = Image.open(BytesIO(thumb_data))
     w, h = image.size
-    return apng_data, w, h
+    return mp4_data, w, h, thumb_data
 
 
-def convert_tgs(data: bytes, max_w=256, max_h=256) -> (bytes, int, int):
+def convert_tgs(data: bytes, max_w=256, max_h=256) -> (bytes, int, int, bytes):
     from rlottie_python import LottieAnimation
 
     lottie_json = gzip.decompress(data).decode("utf-8")
@@ -82,6 +113,9 @@ def convert_tgs(data: bytes, max_w=256, max_h=256) -> (bytes, int, int):
         else:
             w = int(w * max_h / h)
             h = max_h
+    # H.264 requires even dimensions
+    w += w % 2
+    h += h % 2
 
     frames = []
     for i in range(frame_count):
@@ -101,38 +135,36 @@ def convert_tgs(data: bytes, max_w=256, max_h=256) -> (bytes, int, int):
     if not frames:
         raise RuntimeError("No frames rendered from TGS animation")
 
-    new_file = BytesIO()
-    if len(frames) == 1:
-        frames[0].save(new_file, "PNG")
-    else:
-        duration_ms = int(1000 / fps)
-        frames[0].save(
-            new_file,
-            format="PNG",
-            save_all=True,
-            append_images=frames[1:],
-            duration=duration_ms,
-            loop=0,
-        )
+    thumb_file = BytesIO()
+    frames[0].save(thumb_file, "PNG")
+    thumb_data = thumb_file.getvalue()
 
-    return new_file.getvalue(), w, h
+    with tempfile.TemporaryDirectory() as tmpdir:
+        duration = frame_count / fps
+        num_loops = max(1, int(10 / duration))
+        looped_frames = frames * num_loops
 
+        for idx, frame in enumerate(looped_frames):
+            frame.save(os.path.join(tmpdir, f"{idx:04d}.png"))
 
+        output_path = os.path.join(tmpdir, "output.mp4")
+        result = subprocess.run([
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-framerate", str(int(fps)),
+            "-i", os.path.join(tmpdir, "%04d.png"),
+            "-c:v", "libx264",
+            "-pix_fmt", "yuv420p",
+            "-an",
+            "-movflags", "+faststart",
+            output_path,
+        ], capture_output=True)
 
-def convert_image(data: bytes, max_w=256, max_h=256) -> (bytes, int, int):
-    image: Image.Image = Image.open(BytesIO(data)).convert("RGBA")
-    new_file = BytesIO()
-    image.save(new_file, "png")
-    w, h = image.size
-    if w > max_w or h > max_h:
-        # Set the width and height to lower values so clients wouldn't show them as huge images
-        if w > h:
-            h = int(h / (w / max_w))
-            w = max_w
-        else:
-            w = int(w / (h / max_h))
-            h = max_h
-    return new_file.getvalue(), w, h
+        if result.returncode != 0:
+            raise RuntimeError(f"ffmpeg conversion failed: {result.stderr.decode()}")
+
+        mp4_data = Path(output_path).read_bytes()
+
+    return mp4_data, w, h, thumb_data
 
 
 def add_to_index(name: str, output_dir: str) -> None:
@@ -152,7 +184,9 @@ def add_to_index(name: str, output_dir: str) -> None:
 
 
 def make_sticker(mxc: str, width: int, height: int, size: int,
-                 body: str = "") -> matrix.StickerInfo:
+                 body: str = "", mimetype: str = "image/png",
+                 thumbnail_mxc: str = None,
+                 thumbnail_size: int = None) -> matrix.StickerInfo:
     return {
         "body": body,
         "url": mxc,
@@ -160,14 +194,14 @@ def make_sticker(mxc: str, width: int, height: int, size: int,
             "w": width,
             "h": height,
             "size": size,
-            "mimetype": "image/png",
+            "mimetype": mimetype,
 
             # Element iOS compatibility hack
-            "thumbnail_url": mxc,
+            "thumbnail_url": thumbnail_mxc or mxc,
             "thumbnail_info": {
                 "w": width,
                 "h": height,
-                "size": size,
+                "size": thumbnail_size or size,
                 "mimetype": "image/png",
             },
         },
@@ -179,9 +213,9 @@ def add_thumbnails(stickers: List[matrix.StickerInfo], stickers_data: Dict[str, 
     thumbnails = Path(output_dir, "thumbnails")
     thumbnails.mkdir(parents=True, exist_ok=True)
 
-    for sticker in stickers:
+    for sticker in stickers:       
         image_data, _, _ = convert_image(stickers_data[sticker["url"]], 128, 128)
-
+        
         name = sticker["url"].split("/")[-1]
         thumbnail_path = thumbnails / name
         thumbnail_path.write_bytes(image_data)
