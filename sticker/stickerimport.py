@@ -36,10 +36,10 @@ async def reupload_document(client: TelegramClient, document: Document) -> Tuple
 
     if document.mime_type == "video/webm":
         data, width, height = util.convert_video(data)
-        mimetype, ext = "image/webp", "webp"
+        mimetype, ext = "image/gif", "gif"
     elif document.mime_type == "application/x-tgsticker":
         data, width, height = util.convert_tgs(data)
-        mimetype, ext = "image/webp", "webp"
+        mimetype, ext = "image/gif", "gif"
     else:
         data, width, height = util.convert_image(data)
         mimetype, ext = "image/png", "png"

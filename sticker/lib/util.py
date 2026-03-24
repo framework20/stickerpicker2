@@ -53,31 +53,32 @@ def convert_image(data: bytes, max_w=256, max_h=256) -> (bytes, int, int):
 def convert_video(data: bytes, max_w=256, max_h=256) -> (bytes, int, int):
     with tempfile.TemporaryDirectory() as tmpdir:
         input_path = os.path.join(tmpdir, "input.webm")
-        output_path = os.path.join(tmpdir, "output.webp")
+        output_path = os.path.join(tmpdir, "output.gif")
 
         with open(input_path, "wb") as f:
             f.write(data)
 
+        scale = (
+            f"scale='min({max_w},iw)':'min({max_h},ih)'"
+            f":force_original_aspect_ratio=decrease"
+        )
         result = subprocess.run([
             "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
             "-i", input_path,
-            "-vf", (
-                f"scale='min({max_w},iw)':'min({max_h},ih)'"
-                f":force_original_aspect_ratio=decrease"
-            ),
+            "-filter_complex",
+            f"{scale},split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse",
             "-loop", "0",
-            "-f", "webp",
             output_path,
         ], capture_output=True)
 
         if result.returncode != 0:
             raise RuntimeError(f"ffmpeg conversion failed: {result.stderr.decode()}")
 
-        webp_data = Path(output_path).read_bytes()
+        gif_data = Path(output_path).read_bytes()
 
-    image = Image.open(BytesIO(webp_data))
+    image = Image.open(BytesIO(gif_data))
     w, h = image.size
-    return webp_data, w, h
+    return gif_data, w, h
 
 
 def convert_tgs(data: bytes, max_w=256, max_h=256) -> (bytes, int, int):
@@ -117,18 +118,27 @@ def convert_tgs(data: bytes, max_w=256, max_h=256) -> (bytes, int, int):
     if not frames:
         raise RuntimeError("No frames rendered from TGS animation")
 
-    new_file = BytesIO()
-    duration_ms = int(1000 / fps)
-    frames[0].save(
-        new_file,
-        format="WEBP",
-        save_all=True,
-        append_images=frames[1:],
-        duration=duration_ms,
-        loop=0,
-    )
+    with tempfile.TemporaryDirectory() as tmpdir:
+        for idx, frame in enumerate(frames):
+            frame.save(os.path.join(tmpdir, f"{idx:04d}.png"))
 
-    return new_file.getvalue(), w, h
+        output_path = os.path.join(tmpdir, "output.gif")
+        result = subprocess.run([
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-framerate", str(int(fps)),
+            "-i", os.path.join(tmpdir, "%04d.png"),
+            "-filter_complex",
+            "split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse",
+            "-loop", "0",
+            output_path,
+        ], capture_output=True)
+
+        if result.returncode != 0:
+            raise RuntimeError(f"ffmpeg conversion failed: {result.stderr.decode()}")
+
+        gif_data = Path(output_path).read_bytes()
+
+    return gif_data, w, h
 
 
 def add_to_index(name: str, output_dir: str) -> None:
