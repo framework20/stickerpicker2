@@ -33,7 +33,13 @@ async def reupload_document(client: TelegramClient, document: Document) -> Tuple
     print(f"Reuploading {document.id}", end="", flush=True)
     data = await client.download_media(document, file=bytes)
     print(".", end="", flush=True)
-    data, width, height = util.convert_image(data)
+    print(document.mime_type)
+    if document.mime_type == 'video/webm':
+        data, width, height = util.convert_video(data)
+    elif document.mime_type == 'application/x-tgsticker':
+        data, width, height = util.convert_tgs(data)
+    else:
+        data, width, height = util.convert_image(data)
     print(".", end="", flush=True)
     mxc = await matrix.upload(data, "image/png", f"{document.id}.png")
     print(".", flush=True)

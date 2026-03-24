@@ -15,16 +15,109 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 from functools import partial
 from io import BytesIO
+import gzip
 import os.path
 import json
 from pathlib import Path
 from typing import Dict, List
+import tempfile
+import subprocess
 
 from PIL import Image
+
+try:
+    from PIL.ImageMath import unsafe_eval as _imagemath_eval
+except ImportError:
+    from PIL.ImageMath import eval as _imagemath_eval
 
 from . import matrix
 
 open_utf8 = partial(open, encoding='UTF-8')
+
+def convert_video(data: bytes, max_w=256, max_h=256) -> (bytes, int, int):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        input_path = os.path.join(tmpdir, "input.webm")
+        output_path = os.path.join(tmpdir, "output.apng")
+
+        with open(input_path, "wb") as f:
+            f.write(data)
+
+        result = subprocess.run([
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-i", input_path,
+            "-vf", (
+                f"scale='min({max_w},iw)':'min({max_h},ih)'"
+                f":force_original_aspect_ratio=decrease"
+            ),
+            "-plays", "0",
+            "-f", "apng",
+            output_path,
+        ], capture_output=True)
+
+        if result.returncode != 0:
+            raise RuntimeError(f"ffmpeg conversion failed: {result.stderr.decode()}")
+
+        apng_data = Path(output_path).read_bytes()
+
+    image = Image.open(BytesIO(apng_data))
+    w, h = image.size
+    return apng_data, w, h
+
+
+def convert_tgs(data: bytes, max_w=256, max_h=256) -> (bytes, int, int):
+    from rlottie_python import LottieAnimation
+
+    lottie_json = gzip.decompress(data).decode("utf-8")
+    anim = LottieAnimation.from_data(lottie_json)
+
+    frame_count = anim.lottie_animation_get_totalframe()
+    fps = anim.lottie_animation_get_framerate()
+    orig_w, orig_h = anim.lottie_animation_get_size()
+
+    w, h = orig_w, orig_h
+    if w > max_w or h > max_h:
+        if w >= h:
+            h = int(h * max_w / w)
+            w = max_w
+        else:
+            w = int(w * max_h / h)
+            h = max_h
+
+    frames = []
+    for i in range(frame_count):
+        buf = anim.lottie_animation_render(frame_num=i, width=w, height=h)
+        # rlottie outputs premultiplied ARGB32 (BGRA bytes on little-endian)
+        frame = Image.frombytes("RGBA", (w, h), buf, "raw", "BGRA")
+        r, g, b, a = frame.split()
+        frame = Image.merge("RGBA", [
+            _imagemath_eval(
+                "convert(min((c * 255) / max(a, 1), 255), 'L')",
+                c=c, a=a,
+            )
+            for c in (r, g, b)
+        ] + [a])
+        frames.append(frame)
+
+    if not frames:
+        raise RuntimeError("No frames rendered from TGS animation")
+
+    new_file = BytesIO()
+    if len(frames) == 1:
+        frames[0].save(new_file, "PNG")
+    else:
+        duration_ms = int(1000 / fps)
+        frames[0].save(
+            new_file,
+            format="PNG",
+            save_all=True,
+            append_images=frames[1:],
+            duration=duration_ms,
+            loop=0,
+        )
+
+    return new_file.getvalue(), w, h
+
+
 
 def convert_image(data: bytes, max_w=256, max_h=256) -> (bytes, int, int):
     image: Image.Image = Image.open(BytesIO(data)).convert("RGBA")
@@ -86,9 +179,9 @@ def add_thumbnails(stickers: List[matrix.StickerInfo], stickers_data: Dict[str, 
     thumbnails = Path(output_dir, "thumbnails")
     thumbnails.mkdir(parents=True, exist_ok=True)
 
-    for sticker in stickers:       
+    for sticker in stickers:
         image_data, _, _ = convert_image(stickers_data[sticker["url"]], 128, 128)
-        
+
         name = sticker["url"].split("/")[-1]
         thumbnail_path = thumbnails / name
         thumbnail_path.write_bytes(image_data)
