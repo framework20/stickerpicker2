@@ -34,28 +34,22 @@ async def reupload_document(client: TelegramClient, document: Document) -> Tuple
     data = await client.download_media(document, file=bytes)
     print(".", end="", flush=True)
 
-    if document.mime_type in ("video/webm", "application/x-tgsticker"):
-        if document.mime_type == "video/webm":
-            video_data, width, height, thumb_data = util.convert_video(data)
-        else:
-            video_data, width, height, thumb_data = util.convert_tgs(data)
-        print(".", end="", flush=True)
-        mxc = await matrix.upload(video_data, "video/mp4", f"{document.id}.mp4")
-        print(".", end="", flush=True)
-        thumb_mxc = await matrix.upload(thumb_data, "image/png", f"{document.id}_thumb.png")
-        print(".", flush=True)
-        return util.make_sticker(
-            mxc, width, height, len(video_data),
-            mimetype="video/mp4",
-            thumbnail_mxc=thumb_mxc,
-            thumbnail_size=len(thumb_data),
-        ), thumb_data
+    if document.mime_type == "video/webm":
+        data, width, height = util.convert_video(data)
+        mimetype, ext = "image/webp", "webp"
+    elif document.mime_type == "application/x-tgsticker":
+        data, width, height = util.convert_tgs(data)
+        mimetype, ext = "image/webp", "webp"
+    else:
+        data, width, height = util.convert_image(data)
+        mimetype, ext = "image/png", "png"
 
-    data, width, height = util.convert_image(data)
     print(".", end="", flush=True)
-    mxc = await matrix.upload(data, "image/png", f"{document.id}.png")
+    mxc = await matrix.upload(data, mimetype, f"{document.id}.{ext}")
     print(".", flush=True)
-    return util.make_sticker(mxc, width, height, len(data)), data
+    return util.make_sticker(mxc, width, height, len(data),
+                             mimetype=mimetype,
+                             filename=f"{document.id}.{ext}"), data
 
 
 def add_meta(document: Document, info: matrix.StickerInfo, pack: StickerSetFull) -> None:

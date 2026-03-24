@@ -50,52 +50,37 @@ def convert_image(data: bytes, max_w=256, max_h=256) -> (bytes, int, int):
     return new_file.getvalue(), w, h
 
 
-def convert_video(data: bytes, max_w=256, max_h=256) -> (bytes, int, int, bytes):
+def convert_video(data: bytes, max_w=256, max_h=256) -> (bytes, int, int):
     with tempfile.TemporaryDirectory() as tmpdir:
         input_path = os.path.join(tmpdir, "input.webm")
-        output_path = os.path.join(tmpdir, "output.mp4")
-        thumb_path = os.path.join(tmpdir, "thumb.png")
+        output_path = os.path.join(tmpdir, "output.webp")
 
         with open(input_path, "wb") as f:
             f.write(data)
 
         result = subprocess.run([
             "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-            "-stream_loop", "-1",
             "-i", input_path,
-            "-t", "10",
             "-vf", (
                 f"scale='min({max_w},iw)':'min({max_h},ih)'"
-                f":force_original_aspect_ratio=decrease,"
-                f"pad=ceil(iw/2)*2:ceil(ih/2)*2"
+                f":force_original_aspect_ratio=decrease"
             ),
-            "-c:v", "libx264",
-            "-pix_fmt", "yuv420p",
-            "-an",
-            "-movflags", "+faststart",
+            "-loop", "0",
+            "-f", "webp",
             output_path,
         ], capture_output=True)
 
         if result.returncode != 0:
             raise RuntimeError(f"ffmpeg conversion failed: {result.stderr.decode()}")
 
-        subprocess.run([
-            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-            "-i", output_path,
-            "-vframes", "1",
-            "-f", "image2",
-            thumb_path,
-        ], capture_output=True, check=True)
+        webp_data = Path(output_path).read_bytes()
 
-        mp4_data = Path(output_path).read_bytes()
-        thumb_data = Path(thumb_path).read_bytes()
-
-    image = Image.open(BytesIO(thumb_data))
+    image = Image.open(BytesIO(webp_data))
     w, h = image.size
-    return mp4_data, w, h, thumb_data
+    return webp_data, w, h
 
 
-def convert_tgs(data: bytes, max_w=256, max_h=256) -> (bytes, int, int, bytes):
+def convert_tgs(data: bytes, max_w=256, max_h=256) -> (bytes, int, int):
     from rlottie_python import LottieAnimation
 
     lottie_json = gzip.decompress(data).decode("utf-8")
@@ -113,9 +98,6 @@ def convert_tgs(data: bytes, max_w=256, max_h=256) -> (bytes, int, int, bytes):
         else:
             w = int(w * max_h / h)
             h = max_h
-    # H.264 requires even dimensions
-    w += w % 2
-    h += h % 2
 
     frames = []
     for i in range(frame_count):
@@ -135,36 +117,18 @@ def convert_tgs(data: bytes, max_w=256, max_h=256) -> (bytes, int, int, bytes):
     if not frames:
         raise RuntimeError("No frames rendered from TGS animation")
 
-    thumb_file = BytesIO()
-    frames[0].save(thumb_file, "PNG")
-    thumb_data = thumb_file.getvalue()
+    new_file = BytesIO()
+    duration_ms = int(1000 / fps)
+    frames[0].save(
+        new_file,
+        format="WEBP",
+        save_all=True,
+        append_images=frames[1:],
+        duration=duration_ms,
+        loop=0,
+    )
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        duration = frame_count / fps
-        num_loops = max(1, int(10 / duration))
-        looped_frames = frames * num_loops
-
-        for idx, frame in enumerate(looped_frames):
-            frame.save(os.path.join(tmpdir, f"{idx:04d}.png"))
-
-        output_path = os.path.join(tmpdir, "output.mp4")
-        result = subprocess.run([
-            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-            "-framerate", str(int(fps)),
-            "-i", os.path.join(tmpdir, "%04d.png"),
-            "-c:v", "libx264",
-            "-pix_fmt", "yuv420p",
-            "-an",
-            "-movflags", "+faststart",
-            output_path,
-        ], capture_output=True)
-
-        if result.returncode != 0:
-            raise RuntimeError(f"ffmpeg conversion failed: {result.stderr.decode()}")
-
-        mp4_data = Path(output_path).read_bytes()
-
-    return mp4_data, w, h, thumb_data
+    return new_file.getvalue(), w, h
 
 
 def add_to_index(name: str, output_dir: str) -> None:
@@ -185,8 +149,7 @@ def add_to_index(name: str, output_dir: str) -> None:
 
 def make_sticker(mxc: str, width: int, height: int, size: int,
                  body: str = "", mimetype: str = "image/png",
-                 thumbnail_mxc: str = None,
-                 thumbnail_size: int = None) -> matrix.StickerInfo:
+                 filename: str = "") -> matrix.StickerInfo:
     return {
         "body": body,
         "url": mxc,
@@ -197,15 +160,16 @@ def make_sticker(mxc: str, width: int, height: int, size: int,
             "mimetype": mimetype,
 
             # Element iOS compatibility hack
-            "thumbnail_url": thumbnail_mxc or mxc,
+            "thumbnail_url": mxc,
             "thumbnail_info": {
                 "w": width,
                 "h": height,
-                "size": thumbnail_size or size,
-                "mimetype": "image/png",
+                "size": size,
+                "mimetype": mimetype,
             },
         },
         "msgtype": "m.sticker",
+        "filename": filename,
     }
 
 
